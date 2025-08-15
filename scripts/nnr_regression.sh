@@ -1,4 +1,0 @@
-# Time-split: train 2010+2014 -> test 2016 (log1p, không smearing, one-hot huyện)
-python nnr_regression.py --data_dir ./data --run time --target AgrInc --train_years 2010 2014 --test_year 2016 --log_target log1p --exclude_related_income --winsor_lower 0.02 --winsor_upper 0.98 --onehot_geo district --dropout 0.2 --l2 5e-4 --epochs 300 --batch_size 128 --patience 20 
-# Cross-validation 10-fold (GroupKFold), log1p
-python nnr_regression.py --data_dir ./data --run cv --cv 10 --target AgrInc --log_target log1p --exclude_related_income --onehot_geo province --drop_first --epochs 200 --batch_size 128 --patience 15

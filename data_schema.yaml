@@ -1,0 +1,24 @@
+numeric:
+  - Age # Tuổi của chủ hộ (năm)
+  - Labor # Số lao động trong hộ (người)
+  - Cropsize # Diện tích đất trồng trọt của hộ (m²)
+  - Irrsize # Diện tích đất được tưới hoặc có thủy lợi (m²)
+  - disCen # Khoảng cách từ nhà tới trung tâm xã (km)
+  - disRoad # Khoảng cách từ nhà tới đường nhựa (km)
+  - disSell # Khoảng cách từ nhà tới điểm bán hàng (km)
+
+categorical_binary:
+  - Male # Giới tính chủ hộ: 1 = nam, 0 = nữ
+  - Kinh # Dân tộc Kinh: 1 = Kinh, 0 = khác
+  - Married # Tình trạng hôn nhân: 1 = đã kết hôn, 0 = chưa
+  - Poor # Hộ nghèo: 1 = nghèo, 0 = không
+  - Electricity # Sử dụng điện: 1 = có điện, 0 = không
+  - natShock # Sốc thiên tai: 1 = từng gặp thiên tai, 0 = không
+  - ecoShock # Sốc kinh tế: 1 = từng gặp khó khăn kinh tế, 0 = không
+  - socShock # Sốc xã hội: 1 = từng gặp biến cố xã hội, 0 = không
+  - Relation # Có người thân là cán bộ xã: 1 = có, 0 = không
+  - Tea # Hộ có trồng chè: 1 = có, 0 = không (nếu biến này có trong dataset)
+
+categorical_ordinal:
+  - Edu # Trình độ học vấn chủ hộ: mã 1–7 (1 = không đi học, 7 = đại học trở lên)
+    # Trong pipeline nên One-Hot + drop_first để tránh đa cộng tuyến

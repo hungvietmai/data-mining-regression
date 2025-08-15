@@ -1,334 +1,532 @@
 """
-baseline_regression.py — OLS & Huber baseline cho dự báo thu nhập nông nghiệp
+Baseline Linear Models (schema-driven, time-split)
+-------------------------------------------------
+Train baseline models for tabular survey data with a time-based split.
+Supported models:
+  - OLS (statsmodels if available; else sklearn LinearRegression fallback)
+  - HuberRegressor (robust to outliers)
 
-Chức năng:
-- Chạy 2 chế độ:
-    * time: Train 2014 -> Test 2016 (temporal generalization)
-    * cv:   GroupKFold 10 trên toàn bộ dữ liệu (IID generalization, nhóm theo hộ)
-- Target: AgrInc (mặc định) hoặc CropInc
-- Tuỳ chọn log-transform mục tiêu (--log_target log1p) để ổn định phương sai
-- Tiền xử lý: impute, (tùy chọn) winsorization, one-hot categorical, (tùy chọn) scale numeric
-- Mô hình: OLS (LinearRegression) & HuberRegressor
-- Đánh giá: MAE, RMSE, R2. Với log-target, báo cáo thêm MAE/RMSE/R2 trên thang gốc.
-- Xuất: results_baseline/*.csv (kết quả tổng hợp, hệ số OLS/Huber, lỗi theo nhóm Kinh/tinh)
+Features
+- Schema-driven preprocessing from YAML: numeric / categorical_binary / categorical_ordinal
+- Safe preprocessing: impute, optional winsorize, optional scaling, one-hot (drop_first optional)
+- Target transform: none | log1p (with Duan smearing on back-transform) | asinh
+- Leakage control for income-like targets
+- Metrics on modeling scale and on raw scale (if transform used)
+- Save coefficients/feature importances and group errors (Kinh/tinh) if columns exist
+- Save predictions (optional)
+
+Example
+-------
+python baseline_linear_time_split.py \
+  --data_dir ./data --schema_path ./data_schema.yaml \
+  --run time --target AgrInc --train_years 2010 2014 --test_year 2016 \
+  --log_target log1p --smearing \
+  --winsor_lower 0.05 --winsor_upper 0.95 --drop_first --scale_numeric \
+  --model both --results_dir ./results_baseline
 """
 
+from __future__ import annotations
 import os
+import sys
 import argparse
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import numpy as np
 import pandas as pd
 
+# YAML schema
+try:
+    import yaml  # pip install pyyaml
+except Exception:
+    yaml = None
+
+from packaging import version
+from sklearn import __version__ as sklearn_version
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import GroupKFold, KFold
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
+
+# Linear models
 from sklearn.linear_model import LinearRegression, HuberRegressor
-from sklearn import __version__ as sklearn_version
-from packaging import version
+
+# Try statsmodels for true OLS (otherwise fallback to sklearn LinearRegression)
+try:
+    import statsmodels.api as sm
+    _HAS_SM = True
+except Exception:
+    _HAS_SM = False
 
 # -----------------
-# Utility
+# Utils
 # -----------------
-def rmse(y_true, y_pred):
+
+def rmse(y_true, y_pred) -> float:
     return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
 
-def onehot_compat(drop='first'):
-    # Luôn trả dense output; tương thích sklearn>=1.2 và cũ hơn
+
+def onehot_compat(drop='first') -> OneHotEncoder:
+    """Compat giữa sklearn <1.2 và >=1.2 (sparse vs sparse_output)."""
     if version.parse(sklearn_version) >= version.parse("1.2"):
         return OneHotEncoder(handle_unknown='ignore', drop=drop, sparse_output=False)
     return OneHotEncoder(handle_unknown='ignore', drop=drop, sparse=False)
 
+
 class QuantileClipper:
-    """Transformer đơn giản để winsorize numeric theo phân vị (dùng trong Pipeline)."""
-    def __init__(self, lower=0.0, upper=1.0):
+    """Winsorize numeric theo phân vị (dùng trong Pipeline)."""
+    def __init__(self, lower: float = 0.0, upper: float = 1.0):
         self.lower = lower
         self.upper = upper
-        self.lo_ = None
-        self.hi_ = None
+        self.lo_: Optional[np.ndarray] = None
+        self.hi_: Optional[np.ndarray] = None
+
     def fit(self, X, y=None):
         X = np.asarray(X, dtype=float)
-        if X.ndim == 1: X = X.reshape(-1,1)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
         if self.lower <= 0.0 and self.upper >= 1.0:
-            # no-op
-            self.lo_ = None; self.hi_ = None
+            self.lo_ = None
+            self.hi_ = None
             return self
         self.lo_ = np.nanquantile(X, self.lower, axis=0)
         self.hi_ = np.nanquantile(X, self.upper, axis=0)
         self.hi_ = np.maximum(self.hi_, self.lo_ + 1e-12)
         return self
+
     def transform(self, X):
-        if self.lo_ is None: return X
+        if self.lo_ is None:
+            return X
         X = np.asarray(X, dtype=float)
-        if X.ndim == 1: X = X.reshape(-1,1)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
         return np.clip(X, self.lo_, self.hi_)
 
+
+def duan_smearing(y_true_log: np.ndarray, y_pred_log: np.ndarray, clip_range: Optional[Tuple[float,float]] = None) -> float:
+    resid = y_true_log - y_pred_log
+    s = float(np.mean(np.exp(resid)))
+    if clip_range is not None:
+        s = float(np.clip(s, clip_range[0], clip_range[1]))
+    return s
+
+
+def evaluate(y_true, y_pred) -> Dict[str, float]:
+    return {
+        'MAE': float(mean_absolute_error(y_true, y_pred)),
+        'RMSE': rmse(y_true, y_pred),
+        'R2': float(r2_score(y_true, y_pred))
+    }
+
+
+def get_feature_names(preproc: ColumnTransformer) -> List[str]:
+    names: List[str] = []
+    for name, transformer, cols in preproc.transformers_:
+        if name == 'remainder' and transformer == 'drop':
+            continue
+        if hasattr(transformer, 'named_steps'):
+            last = list(transformer.named_steps.values())[-1]
+            if hasattr(last, 'get_feature_names_out'):
+                try:
+                    feats = last.get_feature_names_out(cols)
+                except Exception:
+                    feats = cols
+            else:
+                feats = cols
+        else:
+            feats = cols
+        names.extend(list(feats))
+    return names
+
+
 # -----------------
-# Data loading
+# Data I/O & Schema
 # -----------------
+
 def load_year(data_dir: str, year: int) -> pd.DataFrame:
-    p = os.path.join(data_dir, f"{year}.dta")
-    if not os.path.exists(p):
-        raise FileNotFoundError(f"Không thấy file {p}")
-    return pd.read_stata(p)
+    candidates = [f"{year}_clean.csv", f"{year}.csv", f"{year}.dta"]
+    for name in candidates:
+        p = os.path.join(data_dir, name)
+        if os.path.exists(p):
+            print(f"[INFO] Loading {p} ...")
+            if name.endswith('.csv'):
+                return pd.read_csv(p)
+            else:
+                return pd.read_stata(p)
+    raise FileNotFoundError(f"Không thấy file cho năm {year} trong {data_dir} (tìm: {candidates})")
+
+
+def load_schema(schema_path: str) -> Dict[str, List[str]]:
+    if yaml is None:
+        print("[ERROR] Thiếu thư viện PyYAML. Cài đặt: pip install pyyaml", file=sys.stderr)
+        sys.exit(2)
+    with open(schema_path, 'r', encoding='utf-8') as f:
+        schema = yaml.safe_load(f)
+    for k in ['numeric', 'categorical_binary', 'categorical_ordinal']:
+        if k not in schema:
+            schema[k] = []
+    return schema
+
+
+def enforce_schema(df: pd.DataFrame, schema: Dict[str, List[str]]) -> pd.DataFrame:
+    df = df.copy()
+    for c in schema.get('numeric', []):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    for c in schema.get('categorical_binary', []) + schema.get('categorical_ordinal', []):
+        if c in df.columns:
+            df[c] = df[c].astype('category')
+    return df
+
 
 # -----------------
-# Preprocessing
+# Preprocessor builder
 # -----------------
-BINARY_LIKE = [
-    "Kinh","Poor","Moneysupp","Electricity","Male","Married",
-    "Treat","Contract","Rice","Veg","Coffee","Tea","natShock","ecoShock","socShock"
-]
 
-def detect_cols(df: pd.DataFrame, geo_level: str, year_as_category: bool) -> Tuple[List[str], List[str]]:
-    cat_cols = df.select_dtypes(include=['object','category']).columns.tolist()
-    # Geo
-    add = []
-    if geo_level == 'province': add = ['tinh']
-    elif geo_level == 'district': add = ['tinh','quan']
-    elif geo_level in ('commune','all'): add = ['tinh','quan','xa']
-    for c in add:
-        if c in df.columns and c not in cat_cols:
-            cat_cols.append(c)
-    # Year
-    if year_as_category and 'Year' in df.columns and 'Year' not in cat_cols:
-        cat_cols.append('Year')
-    # Numeric = số trừ các cột categorical
-    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    num_cols = [c for c in num_cols if c not in cat_cols]
-    return num_cols, cat_cols
+def build_preprocessor_from_schema(
+    X: pd.DataFrame,
+    schema: Dict[str, List[str]],
+    exclude_cols: List[str],
+    winsor_lower: float,
+    winsor_upper: float,
+    scale_numeric: bool,
+    drop_first: bool,
+    year_as_category: bool,
+) -> Tuple[ColumnTransformer, List[str], List[str]]:
+    df = X.copy()
 
-def build_preprocessor(df: pd.DataFrame, exclude_cols: List[str], geo_level: str,
-                       year_as_category: bool, winsor_lower: float, winsor_upper: float,
-                       scale_numeric: bool, drop_first: bool) -> Tuple[ColumnTransformer, List[str], List[str]]:
-    cols = [c for c in df.columns if c not in exclude_cols]
-    tmp = df[cols].copy()
-    num_cols, cat_cols = detect_cols(tmp, geo_level, year_as_category)
+    # Treat year as category if requested
+    if year_as_category:
+        for yc in ['year', 'Year']:
+            if yc in df.columns:
+                df[yc] = df[yc].astype(str)
 
-    num_steps = [('imp', SimpleImputer(strategy='median'))]
-    # winsorization optional
-    if winsor_lower is not None and winsor_upper is not None and (winsor_lower>0.0 or winsor_upper<1.0):
+    # Select columns by schema
+    num_cols = [c for c in schema.get('numeric', []) if c in df.columns and c not in exclude_cols]
+    cat_cols = [c for c in (schema.get('categorical_binary', []) + schema.get('categorical_ordinal', []))
+                if c in df.columns and c not in exclude_cols]
+
+    # Warn missing schema columns
+    missing = [c for c in schema.get('numeric', []) + schema.get('categorical_binary', []) + schema.get('categorical_ordinal', [])
+               if c not in df.columns and c not in exclude_cols]
+    if missing:
+        print(f"[WARN] Các cột trong schema không có trong dữ liệu và sẽ bỏ qua: {missing}")
+
+    num_steps = [('imputer', SimpleImputer(strategy='median'))]
+    if winsor_lower > 0.0 or winsor_upper < 1.0:
         num_steps.append(('winsor', QuantileClipper(winsor_lower, winsor_upper)))
     if scale_numeric:
-        num_steps.append(('sc', StandardScaler()))
+        num_steps.append(('scaler', StandardScaler(with_mean=True, with_std=True)))
 
-    cat_steps = [('imp', SimpleImputer(strategy='most_frequent')),
-                 ('ohe', onehot_compat(drop='first' if drop_first else None))]
+    cat_steps = [
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('ohe', onehot_compat(drop='first' if drop_first else None)),
+    ]
 
     preproc = ColumnTransformer(
         transformers=[
-            ('num', Pipeline(steps=num_steps), num_cols),
-            ('cat', Pipeline(steps=cat_steps), cat_cols)
-        ]
+            ('num', Pipeline(num_steps), num_cols),
+            ('cat', Pipeline(cat_steps), cat_cols),
+        ],
+        remainder='drop',
     )
     return preproc, num_cols, cat_cols
 
-def get_feature_names(preproc: ColumnTransformer) -> List[str]:
-    names = []
-    for name, trans, cols in preproc.transformers_:
-        if name == 'num':
-            names.extend(cols)
-        elif name == 'cat':
-            ohe = trans.named_steps['ohe']
-            names.extend(list(ohe.get_feature_names_out(cols)))
-    return names
 
 # -----------------
-# Targets & Metrics
+# Targets & exclusions
 # -----------------
-def make_y(series: pd.Series, mode: str) -> Tuple[np.ndarray, Dict]:
-    """mode: 'raw' | 'log1p'
-    - Với 'log1p': clip giá trị âm lên 0 để tránh cảnh báo/NaN khi log1p.
-    """
-    s = pd.to_numeric(series, errors='coerce').values.astype(float)
-    meta = {'mode': mode}
-    if mode == 'raw':
-        y = s
-        meta['invert'] = lambda arr: arr
-    else:
-        s = np.where(np.isfinite(s), s, np.nan)
-        s = np.nan_to_num(s, nan=0.0)   # thay NaN bằng 0
-        s = np.maximum(s, 0.0)          # clip âm lên 0
-        y = np.log1p(s).astype(float)
-        meta['invert'] = lambda arr: np.expm1(arr)
-    return y, meta
 
-def evaluate(y_true, y_pred) -> Dict[str, float]:
-    return {'MAE': float(mean_absolute_error(y_true, y_pred)),
-            'RMSE': rmse(y_true, y_pred),
-            'R2': float(r2_score(y_true, y_pred))}
+def make_y(y: pd.Series, how: str):
+    y = y.copy()
+    if how == 'none':
+        return y.values.astype(float), {'transform': lambda v: v, 'invert': lambda v: v}
+    if how == 'log1p':
+        y = y.fillna(0.0).clip(lower=0.0)
+        return np.log1p(y.values.astype(float)), {'transform': np.log1p, 'invert': np.expm1}
+    if how == 'asinh':
+        return np.arcsinh(y.values.astype(float)), {'transform': np.arcsinh, 'invert': np.sinh}
+    raise ValueError("log_target phải thuộc {none, log1p, asinh}")
 
-# -----------------
-# Runs
-# -----------------
-def run_time_split(df_train: pd.DataFrame, df_test: pd.DataFrame, target: str, args) -> pd.DataFrame:
-    # Exclusions to avoid leakage
-    exclude_cols = ['ma_ho']
-    if args.exclude_related_income:
+
+def get_exclusions(target: str, exclude_related_income: bool) -> List[str]:
+    excl = ['ma_ho']
+    if exclude_related_income:
         if target == 'AgrInc':
-            exclude_cols += ['TotalInc','Wage','CropInc','CropValue']
+            excl += ['TotalInc', 'Wage', 'CropInc', 'CropValue']
         elif target == 'CropInc':
-            exclude_cols += ['TotalInc','Wage','AgrInc']
+            excl += ['TotalInc', 'Wage', 'AgrInc', 'CropValue']
+        else:
+            excl += ['TotalInc', 'Wage']
+    return excl
 
-    # Build X/y
+
+# -----------------
+# Fit helpers
+# -----------------
+
+def fit_ols(X_tr_t: np.ndarray, y_tr: np.ndarray):
+    if _HAS_SM:
+        Xc = sm.add_constant(X_tr_t, has_constant='add')
+        model = sm.OLS(y_tr, Xc)
+        res = model.fit()
+        return res
+    else:
+        lr = LinearRegression(fit_intercept=True, n_jobs=None)
+        lr.fit(X_tr_t, y_tr)
+        return lr
+
+
+def predict_ols(model, X_te_t: np.ndarray) -> np.ndarray:
+    if _HAS_SM and hasattr(model, 'predict') and not isinstance(model, LinearRegression):
+        Xc_te = sm.add_constant(X_te_t, has_constant='add')
+        return np.asarray(model.predict(Xc_te))
+    else:
+        return np.asarray(model.predict(X_te_t))
+
+
+# -----------------
+# Training (time-split)
+# -----------------
+
+def run_time_split(train_dfs: List[pd.DataFrame], test_df: pd.DataFrame, target: str, args, schema: Dict[str, List[str]]) -> pd.DataFrame:
+    df_train = pd.concat(train_dfs, ignore_index=True, sort=False)
+
+    # enforce schema types
+    df_train = enforce_schema(df_train, schema)
+    test_df  = enforce_schema(test_df, schema)
+
+    exclude_cols = get_exclusions(target, args.exclude_related_income)
+
+    # target transform
     y_tr, ymeta = make_y(df_train[target], args.log_target)
-    y_te, _ = make_y(df_test[target], args.log_target)
+    y_te, _     = make_y(test_df[target], args.log_target)
 
-    # Drop rows where y is NaN
     mask_tr = ~np.isnan(y_tr)
     mask_te = ~np.isnan(y_te)
     X_tr = df_train.loc[mask_tr, :].drop(columns=[target])
-    X_te = df_test.loc[mask_te, :].drop(columns=[target])
     y_tr = y_tr[mask_tr]
+    X_te = test_df.loc[mask_te, :].drop(columns=[target])
     y_te = y_te[mask_te]
 
-    # Preprocessor: FIT TRÊN TRAIN CHỈ (tránh leakage)
-    preproc, _, _ = build_preprocessor(
-        X_tr,
-        exclude_cols=exclude_cols, geo_level=args.onehot_geo, year_as_category=args.year_as_category,
+    preproc, _, _ = build_preprocessor_from_schema(
+        X_tr, schema=schema, exclude_cols=exclude_cols,
         winsor_lower=args.winsor_lower, winsor_upper=args.winsor_upper,
-        scale_numeric=args.scale_numeric, drop_first=args.drop_first
+        scale_numeric=args.scale_numeric, drop_first=args.drop_first,
+        year_as_category=args.year_as_category,
     )
 
-    models = {
-        'OLS': LinearRegression(),
-        'HUBER': HuberRegressor(epsilon=1.5, alpha=1e-2, max_iter=2000)
-    }
+    # Fit preprocessor on TRAIN only, then transform both
+    preproc.fit(X_tr, y_tr)
+    X_tr_t = preproc.transform(X_tr)
+    X_te_t = preproc.transform(X_te)
 
-    rows = []
-    for name, model in models.items():
-        pipe = Pipeline([('prep', preproc), ('est', model)])
-        pipe.fit(X_tr, y_tr)
-        yhat = pipe.predict(X_te)
-        rep = evaluate(y_te, yhat)
+    # Feature names for coefficient export
+    feat_names = []
+    try:
+        # Try sklearn >=1.0 get_feature_names_out
+        feat_names = preproc.get_feature_names_out()
+    except Exception:
+        feat_names = []
 
-        # If log-target, also compute metrics on raw scale
-        if args.log_target == 'log1p':
+    reports: List[Dict[str, object]] = []
+
+    # ---------------- OLS ----------------
+    if args.model in ('ols', 'both'):
+        ols_model = fit_ols(X_tr_t, y_tr)
+        yhat_te = predict_ols(ols_model, X_te_t)
+
+        rep = evaluate(y_te, yhat_te)
+        # Back-transform
+        if args.log_target in ('log1p', 'asinh'):
             inv = ymeta['invert']
+            if args.log_target == 'log1p':
+                # Duan smearing on TRAIN
+                yhat_tr = predict_ols(ols_model, X_tr_t)
+                s = duan_smearing(y_tr, yhat_tr, clip_range=(0.5, 1.5)) if args.smearing else 1.0
+                y_true_raw = inv(y_te)
+                y_pred_raw = s * inv(yhat_te)
+                y_pred_raw = np.maximum(y_pred_raw, 0.0)
+                rep['smearing'] = s
+            else:
+                y_true_raw = inv(y_te)
+                y_pred_raw = inv(yhat_te)
             rep.update({
-                'MAE_raw': float(mean_absolute_error(inv(y_te), inv(yhat))),
-                'RMSE_raw': rmse(inv(y_te), inv(yhat)),
-                'R2_raw': float(r2_score(inv(y_te), inv(yhat)))
+                'MAE_raw': float(mean_absolute_error(y_true_raw, y_pred_raw)),
+                'RMSE_raw': rmse(y_true_raw, y_pred_raw),
+                'R2_raw': float(r2_score(y_true_raw, y_pred_raw)),
             })
-        rep.update({'model': name, 'run': 'time', 'train_year': args.train_year, 'test_year': args.test_year})
-        rows.append(rep)
 
-        # Save coefficients for linear models (trên TRAIN)
+        rep.update({'model': 'OLS' if _HAS_SM else 'LinearRegression', 'run': 'time',
+                    'train_years': ','.join(str(y) for y in args.train_years) if args.train_years else str(args.train_year),
+                    'test_year': args.test_year, 'target': target})
+        reports.append(rep)
+
+        # Save coefficients
         try:
-            prep = pipe.named_steps['prep']
-            est = pipe.named_steps['est']
-            feat_names = get_feature_names(prep)
-            coef = getattr(est, 'coef_', None)
-            if coef is not None and len(coef)==len(feat_names):
-                coefs = pd.DataFrame({'feature': feat_names, 'coef': coef})
-                out_path = os.path.join(args.results_dir, f"{name}_coeffs_time_{args.train_year}_{args.test_year}.csv")
-                coefs.to_csv(out_path, index=False)
+            os.makedirs(args.results_dir, exist_ok=True)
+            if _HAS_SM and hasattr(ols_model, 'params'):
+                params = ols_model.params
+                if feat_names:
+                    # align: statsmodels adds const at index 0
+                    coef_df = pd.DataFrame({'feature': ['const'] + list(feat_names), 'coef': params.values})
+                else:
+                    coef_df = pd.DataFrame({'feature': list(params.index), 'coef': params.values})
+            else:
+                coefs = getattr(ols_model, 'coef_', None)
+                intercept = getattr(ols_model, 'intercept_', 0.0)
+                rows = []
+                rows.append({'feature': 'intercept', 'coef': float(intercept)})
+                if coefs is not None:
+                    for i, c in enumerate(coefs):
+                        fname = feat_names[i] if i < len(feat_names) else f'f_{i}'
+                        rows.append({'feature': fname, 'coef': float(c)})
+                coef_df = pd.DataFrame(rows)
+            coef_df.to_csv(os.path.join(args.results_dir, f"OLS_coeffs_time_{rep['train_years']}_{args.test_year}.csv"), index=False)
         except Exception as e:
-            print(f"[WARN] Không xuất được coefficients cho {name}: {e}")
+            print(f"[WARN] Không xuất được coefficients OLS: {e}")
 
-        # Group errors by Kinh and tinh on raw scale if possible
+        # Group errors & predictions
         try:
             df_eval = X_te.copy()
-            df_eval['y_true'] = ymeta['invert'](y_te) if args.log_target=='log1p' else y_te
-            df_eval['y_pred'] = ymeta['invert'](yhat) if args.log_target=='log1p' else yhat
+            if args.log_target in ('log1p', 'asinh'):
+                df_eval['y_true'] = y_true_raw
+                df_eval['y_pred'] = y_pred_raw
+            else:
+                df_eval['y_true'] = y_te
+                df_eval['y_pred'] = yhat_te
             df_eval['abs_err'] = np.abs(df_eval['y_true'] - df_eval['y_pred'])
-            for gcol in ['Kinh','tinh']:
+            for gcol in ['Kinh', 'tinh']:
                 if gcol in df_eval.columns:
-                    grp = df_eval.groupby(gcol, observed=False)['abs_err'].mean().reset_index().rename(columns={'abs_err':'MAE_group'})
-                    outp = os.path.join(args.results_dir, f"{name}_by_{gcol}_time_{args.train_year}_{args.test_year}.csv")
-                    grp.to_csv(outp, index=False)
+                    grp = df_eval.groupby(gcol, observed=False)['abs_err'].mean().reset_index().rename(columns={'abs_err': 'MAE_group'})
+                    grp.to_csv(os.path.join(args.results_dir, f"OLS_by_{gcol}_time_{rep['train_years']}_{args.test_year}.csv"), index=False)
+            if args.save_predictions:
+                out_pred = X_te.copy()
+                out_pred[target + '_true'] = df_eval['y_true']
+                out_pred[target + '_pred'] = df_eval['y_pred']
+                out_pred.to_csv(os.path.join(args.results_dir, f"OLS_preds_time_{rep['train_years']}_{args.test_year}.csv"), index=False)
         except Exception as e:
-            print(f"[WARN] Không xuất được group error cho {name}: {e}")
+            print(f"[WARN] Không xuất được group errors / predictions (OLS): {e}")
 
-    return pd.DataFrame(rows)
+    # ---------------- Huber ----------------
+    if args.model in ('huber', 'both'):
+        huber = HuberRegressor(
+            epsilon=args.huber_epsilon,
+            alpha=args.huber_alpha,
+            max_iter=args.huber_max_iter,
+            fit_intercept=True,
+        )
+        huber.fit(X_tr_t, y_tr)
+        yhat_te = huber.predict(X_te_t)
 
-def run_cv(df_all: pd.DataFrame, target: str, args) -> pd.DataFrame:
-    exclude_cols = ['ma_ho']
-    if args.exclude_related_income:
-        if target == 'AgrInc':
-            exclude_cols += ['TotalInc','Wage','CropInc','CropValue']
-        elif target == 'CropInc':
-            exclude_cols += ['TotalInc','Wage','AgrInc']
-
-    y_all, ymeta = make_y(df_all[target], args.log_target)
-    mask = ~np.isnan(y_all)
-    X_all = df_all.loc[mask, :].drop(columns=[target])
-    y_all = y_all[mask]
-
-    # group by household để tránh leakage qua các năm
-    if set(['tinh','quan','xa','ma_ho']).issubset(df_all.columns):
-        groups = df_all.loc[mask, ['tinh','quan','xa','ma_ho']].astype(str).agg('-'.join, axis=1).values
-        splitter = GroupKFold(n_splits=args.cv).split(X_all, y_all, groups=groups)
-    else:
-        splitter = KFold(n_splits=args.cv, shuffle=True, random_state=42).split(X_all, y_all)
-
-    models = {'OLS': LinearRegression(), 'HUBER': HuberRegressor()}
-
-    rows = []
-    for name, model in models.items():
-        mae_list, rmse_list, r2_list = [], [], []
-        mae_raw_list, rmse_raw_list, r2_raw_list = [], [], []
-        for tr_idx, te_idx in splitter:
-            X_tr, X_te = X_all.iloc[tr_idx], X_all.iloc[te_idx]
-            y_tr, y_te = y_all[tr_idx], y_all[te_idx]
-
-            # Preprocessor FIT TRÊN TRAIN của fold (không leakage)
-            preproc, _, _ = build_preprocessor(
-                X_tr, exclude_cols=exclude_cols, geo_level=args.onehot_geo, year_as_category=args.year_as_category,
-                winsor_lower=args.winsor_lower, winsor_upper=args.winsor_upper,
-                scale_numeric=args.scale_numeric, drop_first=args.drop_first
-            )
-
-            pipe = Pipeline([('prep', preproc), ('est', model)])
-            pipe.fit(X_tr, y_tr)
-            yhat = pipe.predict(X_te)
-            rep = evaluate(y_te, yhat)
-            mae_list.append(rep['MAE']); rmse_list.append(rep['RMSE']); r2_list.append(rep['R2'])
-
+        rep = evaluate(y_te, yhat_te)
+        # Back-transform
+        if args.log_target in ('log1p', 'asinh'):
+            inv = ymeta['invert']
             if args.log_target == 'log1p':
-                inv = ymeta['invert']
-                mae_raw_list.append(float(mean_absolute_error(inv(y_te), inv(yhat))))
-                rmse_raw_list.append(rmse(inv(y_te), inv(yhat)))
-                r2_raw_list.append(float(r2_score(inv(y_te), inv(yhat))))
-
-        res = {
-            'model': name, 'run': 'cv', 'cv': args.cv,
-            'MAE_mean': float(np.mean(mae_list)), 'RMSE_mean': float(np.mean(rmse_list)), 'R2_mean': float(np.mean(r2_list)),
-            'MAE_std': float(np.std(mae_list)), 'RMSE_std': float(np.std(rmse_list)), 'R2_std': float(np.std(r2_list))
-        }
-        if args.log_target == 'log1p':
-            res.update({
-                'MAE_raw_mean': float(np.mean(mae_raw_list)), 'RMSE_raw_mean': float(np.mean(rmse_raw_list)), 'R2_raw_mean': float(np.mean(r2_raw_list)),
-                'MAE_raw_std': float(np.std(mae_raw_list)), 'RMSE_raw_std': float(np.std(rmse_raw_list)), 'R2_raw_std': float(np.std(r2_raw_list))
+                yhat_tr = huber.predict(X_tr_t)
+                s = duan_smearing(y_tr, yhat_tr, clip_range=(0.5, 1.5)) if args.smearing else 1.0
+                y_true_raw = inv(y_te)
+                y_pred_raw = s * inv(yhat_te)
+                y_pred_raw = np.maximum(y_pred_raw, 0.0)
+                rep['smearing'] = s
+            else:
+                y_true_raw = inv(y_te)
+                y_pred_raw = inv(yhat_te)
+            rep.update({
+                'MAE_raw': float(mean_absolute_error(y_true_raw, y_pred_raw)),
+                'RMSE_raw': rmse(y_true_raw, y_pred_raw),
+                'R2_raw': float(r2_score(y_true_raw, y_pred_raw)),
             })
-        rows.append(res)
 
-    return pd.DataFrame(rows).sort_values('RMSE_mean')
+        rep.update({'model': 'Huber', 'run': 'time',
+                    'train_years': ','.join(str(y) for y in args.train_years) if args.train_years else str(args.train_year),
+                    'test_year': args.test_year, 'target': target})
+        reports.append(rep)
+
+        # Save coefficients
+        try:
+            os.makedirs(args.results_dir, exist_ok=True)
+            coefs = getattr(huber, 'coef_', None)
+            intercept = getattr(huber, 'intercept_', 0.0)
+            rows = []
+            rows.append({'feature': 'intercept', 'coef': float(intercept)})
+            if coefs is not None:
+                for i, c in enumerate(coefs):
+                    fname = feat_names[i] if i < len(feat_names) else f'f_{i}'
+                    rows.append({'feature': fname, 'coef': float(c)})
+            coef_df = pd.DataFrame(rows)
+            coef_df.to_csv(os.path.join(args.results_dir, f"Huber_coeffs_time_{rep['train_years']}_{args.test_year}.csv"), index=False)
+        except Exception as e:
+            print(f"[WARN] Không xuất được coefficients Huber: {e}")
+
+        # Group errors & predictions
+        try:
+            df_eval = X_te.copy()
+            if args.log_target in ('log1p', 'asinh'):
+                df_eval['y_true'] = y_true_raw
+                df_eval['y_pred'] = y_pred_raw
+            else:
+                df_eval['y_true'] = y_te
+                df_eval['y_pred'] = yhat_te
+            df_eval['abs_err'] = np.abs(df_eval['y_true'] - df_eval['y_pred'])
+            for gcol in ['Kinh', 'tinh']:
+                if gcol in df_eval.columns:
+                    grp = df_eval.groupby(gcol, observed=False)['abs_err'].mean().reset_index().rename(columns={'abs_err': 'MAE_group'})
+                    grp.to_csv(os.path.join(args.results_dir, f"Huber_by_{gcol}_time_{rep['train_years']}_{args.test_year}.csv"), index=False)
+            if args.save_predictions:
+                out_pred = X_te.copy()
+                out_pred[target + '_true'] = df_eval['y_true']
+                out_pred[target + '_pred'] = df_eval['y_pred']
+                out_pred.to_csv(os.path.join(args.results_dir, f"Huber_preds_time_{rep['train_years']}_{args.test_year}.csv"), index=False)
+        except Exception as e:
+            print(f"[WARN] Không xuất được group errors / predictions (Huber): {e}")
+
+    # return combined report
+    return pd.DataFrame(reports)
+
 
 # -----------------
 # Main
 # -----------------
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default='./data')
-    parser.add_argument('--run', type=str, choices=['time','cv'], default='time')
-    parser.add_argument('--target', type=str, choices=['AgrInc','CropInc'], default='AgrInc')
-    parser.add_argument('--cv', type=int, default=10)
-    parser.add_argument('--train_year', type=int, default=2014)
-    parser.add_argument('--test_year', type=int, default=2016)
-    parser.add_argument('--log_target', type=str, choices=['raw','log1p'], default='log1p')
-    parser.add_argument('--exclude_related_income', action='store_true',
-                        help='Loại các biến có thể làm rò rỉ mục tiêu (TotalInc, Wage, CropInc/CropValue ...)')
-    parser.add_argument('--winsor_lower', type=float, default=None)
-    parser.add_argument('--winsor_upper', type=float, default=None)
-    parser.add_argument('--scale_numeric', action='store_true')
-    parser.add_argument('--onehot_geo', type=str, default='province', choices=['none','province','district','commune','all'])
-    parser.add_argument('--year_as_category', action='store_true')
-    parser.add_argument('--drop_first', action='store_true')
-    parser.add_argument('--results_dir', type=str, default='./results_baseline')
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--data_dir', type=str, required=True)
+    p.add_argument('--schema_path', type=str, required=True)
+    p.add_argument('--run', choices=['time'], default='time', help='Chỉ hỗ trợ time-split')
+    p.add_argument('--target', type=str, default='AgrInc')
+
+    # Chọn năm
+    p.add_argument('--train_year', type=int, default=2014)
+    p.add_argument('--train_years', nargs='*', type=int, default=None)
+    p.add_argument('--test_year', type=int, default=2016)
+
+    # Preprocess
+    p.add_argument('--winsor_lower', type=float, default=0.0)
+    p.add_argument('--winsor_upper', type=float, default=1.0)
+    p.add_argument('--scale_numeric', action='store_true', help='Highly recommended for Huber')
+    p.add_argument('--drop_first', action='store_true')
+    p.add_argument('--year_as_category', action='store_true')
+    p.add_argument('--exclude_related_income', action='store_true')
+
+    # Target transform
+    p.add_argument('--log_target', choices=['none','log1p','asinh'], default='log1p')
+    p.add_argument('--smearing', action='store_true', help='Only for log1p back-transform')
+
+    # Model selection
+    p.add_argument('--model', choices=['ols','huber','both'], default='both')
+
+    # Huber params
+    p.add_argument('--huber_epsilon', type=float, default=1.35, help='Outlier threshold (larger = less robust)')
+    p.add_argument('--huber_alpha', type=float, default=0.0001, help='L2 regularization strength')
+    p.add_argument('--huber_max_iter', type=int, default=1000)
+
+    # I/O
+    p.add_argument('--results_dir', type=str, default='./results_baseline')
+    p.add_argument('--save_predictions', action='store_true')
+
+    args = p.parse_args()
 
     os.makedirs(args.results_dir, exist_ok=True)
 
@@ -337,25 +535,36 @@ def main():
     df2014 = load_year(args.data_dir, 2014)
     df2016 = load_year(args.data_dir, 2016)
 
-    if args.run == 'time':
+    # Load schema
+    schema = load_schema(args.schema_path)
+
+    if args.run != 'time':
+        print('[ERROR] Chỉ hỗ trợ --run time trong bản này.'); sys.exit(2)
+
+    # Chọn train/test theo năm
+    if args.train_years:
         train_map = {2010: df2010, 2014: df2014, 2016: df2016}
-        if args.train_year not in train_map or args.test_year not in train_map:
-            raise SystemExit("train_year/test_year không hợp lệ (phải là 2010/2014/2016)")
-        res = run_time_split(train_map[args.train_year], train_map[args.test_year], args.target, args)
-        out_csv = os.path.join(args.results_dir, f"baseline_{args.target}_time_{args.train_year}_{args.test_year}.csv")
-        res.to_csv(out_csv, index=False)
-        print("=== Time-split Results ===")
-        print(res.to_string(index=False))
-        print(f"[DONE] Saved: {out_csv}")
+        try:
+            train_dfs = [train_map[y] for y in args.train_years]
+        except KeyError as e:
+            print(f"[ERROR] Năm train không hợp lệ: {e}"); sys.exit(2)
+        train_label = ','.join(str(y) for y in args.train_years)
     else:
-        # Merge all
-        df_all = pd.concat([df2010, df2014, df2016], ignore_index=True, sort=False)
-        res = run_cv(df_all, args.target, args)
-        out_csv = os.path.join(args.results_dir, f"baseline_{args.target}_cv_{args.cv}fold.csv")
-        res.to_csv(out_csv, index=False)
-        print("=== CV Results ===")
-        print(res.to_string(index=False))
-        print(f"[DONE] Saved: {out_csv}")
+        train_dfs = [df2014 if args.train_year == 2014 else (df2010 if args.train_year == 2010 else df2016)]
+        train_label = str(args.train_year)
+
+    test_df = df2016 if args.test_year == 2016 else (df2014 if args.test_year == 2014 else df2010)
+
+    # Run
+    res = run_time_split(train_dfs, test_df, args.target, args, schema)
+
+    # Save results
+    out_csv = os.path.join(args.results_dir, f"BASELINE_{args.model}_{args.target}_time_{train_label}_{args.test_year}.csv")
+    res.to_csv(out_csv, index=False)
+    print("=== Time-split Baseline Results ===")
+    print(res.to_string(index=False))
+    print(f"[DONE] Saved: {out_csv}")
+
 
 if __name__ == '__main__':
     main()

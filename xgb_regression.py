@@ -1,22 +1,19 @@
 """
-Random Forest Regression (schema-driven)
----------------------------------------
-Dự báo biến mục tiêu (mặc định: AgrInc) từ dữ liệu khảo sát nhiều năm.
-Đọc cấu hình biến từ data_schema.yaml và CHỈ hỗ trợ chia theo thời gian (time-split).
+XGB Regression (schema-driven)
+---------------------------------
+Huấn luyện mô hình XGBoost để dự báo biến mục tiêu (mặc định: AgrInc)
+trên dữ liệu khảo sát nhiều năm. Bản này đọc cấu hình biến từ data_schema.yaml.
 
-Tính năng chính:
-- Schema-driven: ép kiểu + chọn cột theo data_schema.yaml (numeric / categorical_binary / categorical_ordinal)
-- Tiền xử lý an toàn: impute, winsorize (tùy chọn), OHE (drop_first tùy chọn), scale numeric (tùy chọn)
-- Biến đổi mục tiêu: none | log1p (kèm Duan smearing) | asinh
-- Loại rò rỉ: tự loại các biến thu nhập liên quan khi yêu cầu
-- Báo cáo metrics cả trên thang học và thang gốc (nếu có transform)
-- Hỗ trợ OOB scoring của RandomForest (R2_OOB)
-- Xuất feature importance (impurity) + permutation importance (tùy chọn)
-- Báo cáo MAE theo nhóm (Kinh/tinh) nếu cột tồn tại
-- Tùy chọn gộp danh mục hiếm thành "Other" để tránh unknown-category drift
+Điểm nổi bật:
+- Đọc schema YAML để ép kiểu & chọn cột: numeric / categorical_binary / categorical_ordinal
+- Tiền xử lý: impute, winsorize (tuỳ chọn), One-Hot Encoder (drop_first tuỳ chọn)
+- Biến đổi mục tiêu: none | log1p (kèm Duan smearing) | asinh (xử lý âm/0/dương)
+- XGBoost có L1/L2 (reg_alpha/reg_lambda), early stopping với validation split
+- Exclude các biến dễ gây rò rỉ khi dự báo AgrInc/CropInc
+- Xuất metrics (MAE/RMSE/R2) cả trên thang học và thang gốc (nếu dùng transform)
+- Lưu feature importance và lỗi theo nhóm (Kinh/tinh) nếu cột tồn tại
 """
 
-from __future__ import annotations
 import os
 import sys
 import argparse
@@ -27,7 +24,7 @@ import pandas as pd
 # YAML schema
 try:
     import yaml  # pip install pyyaml
-except Exception:
+except Exception as e:
     yaml = None
 
 from packaging import version
@@ -38,12 +35,17 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.inspection import permutation_importance
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.ensemble import RandomForestRegressor
+
+# XGBoost
+_HAS_XGB = True
+try:
+    from xgboost import XGBRegressor
+except Exception:
+    _HAS_XGB = False
+    from sklearn.ensemble import HistGradientBoostingRegressor  # fallback
 
 # -----------------
-# Utils
+# Helpers
 # -----------------
 
 def rmse(y_true, y_pred) -> float:
@@ -59,11 +61,11 @@ def onehot_compat(drop='first') -> OneHotEncoder:
 
 class QuantileClipper:
     """Winsorize numeric theo phân vị (dùng trong Pipeline)."""
-    def __init__(self, lower: float = 0.0, upper: float = 1.0):
+    def __init__(self, lower=0.0, upper=1.0):
         self.lower = lower
         self.upper = upper
-        self.lo_: Optional[np.ndarray] = None
-        self.hi_: Optional[np.ndarray] = None
+        self.lo_ = None
+        self.hi_ = None
 
     def fit(self, X, y=None):
         X = np.asarray(X, dtype=float)
@@ -107,7 +109,7 @@ def evaluate(y_true, y_pred) -> Dict[str, float]:
 
 
 def get_feature_names(preproc: ColumnTransformer) -> List[str]:
-    names: List[str] = []
+    names = []
     for name, transformer, cols in preproc.transformers_:
         if name == 'remainder' and transformer == 'drop':
             continue
@@ -149,6 +151,7 @@ def load_schema(schema_path: str) -> Dict[str, List[str]]:
         sys.exit(2)
     with open(schema_path, 'r', encoding='utf-8') as f:
         schema = yaml.safe_load(f)
+    # đảm bảo các khoá tồn tại
     for k in ['numeric', 'categorical_binary', 'categorical_ordinal']:
         if k not in schema:
             schema[k] = []
@@ -167,108 +170,32 @@ def enforce_schema(df: pd.DataFrame, schema: Dict[str, List[str]]) -> pd.DataFra
 
 
 # -----------------
-# Rare category grouper
+# Preprocess builder
 # -----------------
 
-class RareCategoryGrouper(BaseEstimator, TransformerMixin):
-    """Gộp các mức danh mục có tần suất < min_count thành nhãn Other.
-    - Fit trên TRAIN → xác định tập mức giữ lại cho từng cột.
-    - Transform: mọi mức không thuộc tập giữ lại → Other.
-    """
-    def __init__(self, cols: List[str], min_count: int = 0, other_label: str = "Other"):
-        self.cols = cols
-        self.min_count = int(min_count)
-        self.other_label = other_label
-        self.keep_levels_: Dict[str, set] = {}
-
-    def fit(self, X, y=None):
-        X = pd.DataFrame(X).copy()
-        self.keep_levels_.clear()
-        if self.min_count <= 0:
-            # Không gộp gì → giữ nguyên (để pipeline không thay đổi)
-            for c in self.cols:
-                if c in X.columns:
-                    vals = pd.Series(X[c]).dropna().astype(str).unique().tolist()
-                    self.keep_levels_[c] = set(vals)
-            return self
-        for c in self.cols:
-            if c in X.columns:
-                vc = pd.Series(X[c]).value_counts(dropna=True)
-                keep = vc[vc >= self.min_count].index.astype(str).tolist()
-                self.keep_levels_[c] = set(keep)
-        return self
-
-    def transform(self, X):
-        X = pd.DataFrame(X).copy()
-        if self.min_count <= 0:
-            # Không thay đổi gì
-            for c in self.cols:
-                if c in X.columns:
-                    X[c] = X[c].astype('category')
-            return X
-        for c in self.cols:
-            if c in X.columns:
-                keep = self.keep_levels_.get(c, set())
-                X[c] = X[c].astype(str)
-                X.loc[~X[c].isin(keep), c] = self.other_label
-                X[c] = X[c].astype('category')
-        return X
-
-
-# -----------------
-# Preprocessor builder
-# -----------------
-
-def build_preprocessor_from_schema(
-    X: pd.DataFrame,
-    schema: Dict[str, List[str]],
-    exclude_cols: List[str],
-    winsor_lower: float,
-    winsor_upper: float,
-    scale_numeric: bool,
-    drop_first: bool,
-    onehot_geo: str,
-    year_as_category: bool,
-    rare_min_count: int,
-) -> Tuple[ColumnTransformer, List[str], List[str]]:
+def build_preprocessor_from_schema(X: pd.DataFrame,
+                                   schema: Dict[str, List[str]],
+                                   exclude_cols: List[str],
+                                   winsor_lower: float,
+                                   winsor_upper: float,
+                                   scale_numeric: bool,
+                                   drop_first: bool,
+                                   year_as_category: bool) -> Tuple[ColumnTransformer, List[str], List[str]]:
     df = X.copy()
+    # Optionally treat 'year' as category
+    if year_as_category and 'year' in df.columns:
+        df['year'] = df['year'].astype(str)
 
-    # Treat year as category if requested
-    if year_as_category:
-        for yc in ['year', 'Year']:
-            if yc in df.columns:
-                df[yc] = df[yc].astype(str)
-
-    # Select columns by schema
+    # Intersect schema lists with existing columns (tránh thiếu cột)
     num_cols = [c for c in schema.get('numeric', []) if c in df.columns and c not in exclude_cols]
     cat_cols = [c for c in (schema.get('categorical_binary', []) + schema.get('categorical_ordinal', []))
                 if c in df.columns and c not in exclude_cols]
 
-    # Geography level control
-    geo_keep: List[str] = []
-    if onehot_geo == 'province':
-        geo_keep = ['tinh']
-    elif onehot_geo == 'district':
-        geo_keep = ['tinh', 'quan']
-    elif onehot_geo == 'commune':
-        geo_keep = ['tinh', 'quan', 'xa']
-    elif onehot_geo == 'none':
-        geo_keep = []
-
-    # Ensure geography columns are included/excluded per selection
-    for g in ['tinh', 'quan', 'xa']:
-        if g in df.columns and g not in cat_cols and (not geo_keep or g in geo_keep):
-            cat_cols.append(g)
-    if geo_keep:
-        cat_cols = [c for c in cat_cols if (c not in {'tinh', 'quan', 'xa'}) or (c in geo_keep)]
-    else:
-        cat_cols = [c for c in cat_cols if c not in {'tinh', 'quan', 'xa'}]
-
-    # Warn missing schema columns
+    # Cảnh báo nếu schema chỉ ra cột không tồn tại
     missing = [c for c in schema.get('numeric', []) + schema.get('categorical_binary', []) + schema.get('categorical_ordinal', [])
                if c not in df.columns and c not in exclude_cols]
     if missing:
-        print(f"[WARN] Các cột trong schema không có trong dữ liệu và sẽ bỏ qua: {missing}")
+        print(f"[WARN] Các cột trong schema không thấy trong dữ liệu hiện tại và sẽ bỏ qua: {missing}")
 
     num_steps = [('imputer', SimpleImputer(strategy='median'))]
     if winsor_lower > 0.0 or winsor_upper < 1.0:
@@ -276,23 +203,23 @@ def build_preprocessor_from_schema(
     if scale_numeric:
         num_steps.append(('scaler', StandardScaler(with_mean=True, with_std=True)))
 
-    # Categorical: impute → rare-group (tùy chọn) → one-hot
-    cat_steps = [('imputer', SimpleImputer(strategy='most_frequent'))]
-    cat_steps.append(('rare', RareCategoryGrouper(cols=cat_cols, min_count=rare_min_count, other_label="Other")))
-    cat_steps.append(('ohe', onehot_compat(drop='first' if drop_first else None)))
+    cat_steps = [
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('ohe', onehot_compat(drop='first' if drop_first else None))
+    ]
 
     preproc = ColumnTransformer(
         transformers=[
             ('num', Pipeline(num_steps), num_cols),
-            ('cat', Pipeline(cat_steps), cat_cols),
+            ('cat', Pipeline(cat_steps), cat_cols)
         ],
-        remainder='drop',
+        remainder='drop'
     )
     return preproc, num_cols, cat_cols
 
 
 # -----------------
-# Targets
+# Target transforms
 # -----------------
 
 def make_y(y: pd.Series, how: str):
@@ -320,21 +247,23 @@ def get_exclusions(target: str, exclude_related_income: bool) -> List[str]:
 
 
 # -----------------
-# Training (time-split)
+# Train/Eval (time-split only)
 # -----------------
 
 def run_time_split(train_dfs: List[pd.DataFrame], test_df: pd.DataFrame, target: str, args, schema: Dict[str, List[str]]) -> pd.DataFrame:
     df_train = pd.concat(train_dfs, ignore_index=True, sort=False)
 
-    # enforce schema types
+    # ép kiểu theo schema (an toàn)
     df_train = enforce_schema(df_train, schema)
     test_df  = enforce_schema(test_df, schema)
 
     exclude_cols = get_exclusions(target, args.exclude_related_income)
 
-    # target transform
-    y_tr, ymeta = make_y(df_train[target], args.log_target)
-    y_te, _     = make_y(test_df[target], args.log_target)
+    # y
+    y_tr_raw = df_train[target]
+    y_te_raw = test_df[target]
+    y_tr, ymeta = make_y(y_tr_raw, args.log_target)
+    y_te, _     = make_y(y_te_raw, args.log_target)
 
     mask_tr = ~np.isnan(y_tr)
     mask_te = ~np.isnan(y_te)
@@ -347,101 +276,100 @@ def run_time_split(train_dfs: List[pd.DataFrame], test_df: pd.DataFrame, target:
         X_tr, schema=schema, exclude_cols=exclude_cols,
         winsor_lower=args.winsor_lower, winsor_upper=args.winsor_upper,
         scale_numeric=args.scale_numeric, drop_first=args.drop_first,
-        onehot_geo=args.onehot_geo, year_as_category=args.year_as_category,
-        rare_min_count=args.rare_min_count,
+        year_as_category=args.year_as_category
     )
 
-    rf = RandomForestRegressor(
-        n_estimators=args.n_estimators,
-        max_depth=args.max_depth if args.max_depth and args.max_depth > 0 else None,
-        min_samples_leaf=args.min_samples_leaf,
-        max_features=args.max_features,
-        bootstrap=True,
-        oob_score=args.oob,
-        n_jobs=-1,
-        random_state=args.random_state,
-    )
+    # Estimator
+    if _HAS_XGB:
+        est = XGBRegressor(
+            objective='reg:squarederror',
+            n_estimators=args.n_estimators,
+            learning_rate=args.learning_rate,
+            max_depth=args.max_depth,
+            subsample=args.subsample,
+            colsample_bytree=args.colsample_bytree,
+            reg_lambda=args.reg_lambda,
+            reg_alpha=args.reg_alpha,
+            min_child_weight=args.min_child_weight,
+            gamma=args.gamma,
+            n_jobs=-1,
+            random_state=args.random_state
+        )
+    else:
+        print("[WARN] xgboost chưa cài; dùng HistGradientBoostingRegressor làm fallback (không có L1).")
+        est = HistGradientBoostingRegressor(
+            max_iter=args.n_estimators,
+            learning_rate=args.learning_rate,
+            max_depth=args.max_depth if args.max_depth and args.max_depth>0 else None,
+            l2_regularization=args.reg_lambda,
+            random_state=args.random_state
+        )
 
-    pipe = Pipeline([('prep', preproc), ('est', rf)])
-    pipe.fit(X_tr, y_tr)
+    pipe = Pipeline([('prep', preproc), ('est', est)])
 
-    # Predict on test
+    # Early stopping (chỉ với XGB). Tách một phần train làm validation.
+    if _HAS_XGB and args.early_stopping_rounds > 0 and 0.0 < args.val_size < 0.5:
+        X_tr2, X_val, y_tr2, y_val = train_test_split(X_tr, y_tr, test_size=args.val_size, random_state=args.random_state)
+        # fit preproc riêng rồi transform -> tránh leak
+        pipe.named_steps['prep'].fit(X_tr2, y_tr2)
+        X_tr2t = pipe.named_steps['prep'].transform(X_tr2)
+        X_valt = pipe.named_steps['prep'].transform(X_val)
+        est = pipe.named_steps['est']
+        est.set_params(early_stopping_rounds=args.early_stopping_rounds)
+        est.fit(X_tr2t, y_tr2, eval_set=[(X_valt, y_val)], verbose=False)
+    else:
+        pipe.fit(X_tr, y_tr)
+
+    # Predict & evaluate (trên scale học)
     yhat_te = pipe.predict(X_te)
-
-    # Metrics on learning scale
     rep = evaluate(y_te, yhat_te)
 
-    # Back-transform to raw scale if needed
+    # Back-transform nếu cần
     if args.log_target in ('log1p', 'asinh'):
         inv = ymeta['invert']
         if args.log_target == 'log1p':
-            s = duan_smearing(y_tr, pipe.predict(X_tr), clip_range=(0.5, 1.5)) if args.smearing else 1.0
+            if args.smearing:
+                # smearing tính trên train (log)
+                yhat_tr = pipe.predict(X_tr)
+                s = duan_smearing(y_tr, yhat_tr, clip_range=(0.5, 1.5))
+            else:
+                s = 1.0
             y_true_raw = inv(y_te)
             y_pred_raw = s * inv(yhat_te)
             y_pred_raw = np.maximum(y_pred_raw, 0.0)
             rep['smearing'] = s
-        else:
+        else:  # asinh
             y_true_raw = inv(y_te)
             y_pred_raw = inv(yhat_te)
         rep.update({
             'MAE_raw': float(mean_absolute_error(y_true_raw, y_pred_raw)),
             'RMSE_raw': rmse(y_true_raw, y_pred_raw),
-            'R2_raw': float(r2_score(y_true_raw, y_pred_raw)),
+            'R2_raw': float(r2_score(y_true_raw, y_pred_raw))
         })
 
-    # OOB score if enabled
-    try:
-        est = pipe.named_steps['est']
-        if hasattr(est, 'oob_score_') and args.oob:
-            rep['R2_OOB'] = float(est.oob_score_)
-    except Exception:
-        pass
-
+    # Thông tin run
     rep.update({
-        'model': 'RF', 'run': 'time', 'target': target,
+        'model': 'XGB' if _HAS_XGB else 'skHGB',
+        'run': 'time',
         'train_years': ','.join(str(y) for y in args.train_years) if args.train_years else str(args.train_year),
         'test_year': args.test_year,
+        'target': target
     })
 
-    # Feature importance (impurity)
+    # Lưu feature importance nếu có
     try:
         est = pipe.named_steps['est']
         prep = pipe.named_steps['prep']
         feat_names = get_feature_names(prep)
         if hasattr(est, 'feature_importances_') and len(feat_names) == len(est.feature_importances_):
-            fim = (
-                pd.DataFrame({'feature': feat_names, 'importance': est.feature_importances_})
-                .sort_values('importance', ascending=False)
-            )
+            fim = pd.DataFrame({'feature': feat_names, 'importance': est.feature_importances_}) \
+                    .sort_values('importance', ascending=False)
             os.makedirs(args.results_dir, exist_ok=True)
-            fim.to_csv(os.path.join(args.results_dir, f"RF_feature_importance_time_{rep['train_years']}_{args.test_year}.csv"), index=False)
+            fim.to_csv(os.path.join(args.results_dir, f"XGB_feature_importance_time_{rep['train_years']}_{args.test_year}.csv"), index=False)
     except Exception as e:
         print(f"[WARN] Không xuất được feature importance: {e}")
 
-    # Permutation importance trên test (tùy chọn)
-    try:
-        if args.perm_importance:
-            result = permutation_importance(
-                pipe, X_te, y_te,
-                n_repeats=args.pi_repeats,
-                random_state=args.random_state,
-                scoring='neg_mean_absolute_error',
-                n_jobs=-1,
-            )
-            feat_names = get_feature_names(pipe.named_steps['prep'])
-            pim = (
-                pd.DataFrame({
-                    'feature': feat_names,
-                    'pi_mean': result.importances_mean,
-                    'pi_std': result.importances_std,
-                })
-                .sort_values('pi_mean', ascending=False)
-            )
-            pim.to_csv(os.path.join(args.results_dir, f"RF_perm_importance_time_{rep['train_years']}_{args.test_year}.csv"), index=False)
-    except Exception as e:
-        print(f"[WARN] Không tính được permutation importance: {e}")
-
-    # Group errors (Kinh, tinh)
+    # Lỗi theo nhóm (Kinh/tinh) trên thang gốc (nếu có transform), ngược lại dùng scale học
     try:
         df_eval = X_te.copy()
         if args.log_target in ('log1p', 'asinh'):
@@ -453,23 +381,18 @@ def run_time_split(train_dfs: List[pd.DataFrame], test_df: pd.DataFrame, target:
         df_eval['abs_err'] = np.abs(df_eval['y_true'] - df_eval['y_pred'])
         for gcol in ['Kinh', 'tinh']:
             if gcol in df_eval.columns:
-                grp = (
-                    df_eval.groupby(gcol, observed=False)['abs_err']
-                    .mean()
-                    .reset_index()
-                    .rename(columns={'abs_err': 'MAE_group'})
-                )
-                grp.to_csv(os.path.join(args.results_dir, f"RF_by_{gcol}_time_{rep['train_years']}_{args.test_year}.csv"), index=False)
+                grp = df_eval.groupby(gcol, observed=False)['abs_err'].mean().reset_index().rename(columns={'abs_err': 'MAE_group'})
+                grp.to_csv(os.path.join(args.results_dir, f"XGB_by_{gcol}_time_{rep['train_years']}_{args.test_year}.csv"), index=False)
     except Exception as e:
         print(f"[WARN] Không xuất được group error: {e}")
 
-    # Save predictions (optional)
+    # Lưu dự đoán nếu yêu cầu
     try:
         if args.save_predictions:
             out_pred = X_te.copy()
             out_pred[target + '_true'] = df_eval['y_true'] if 'y_true' in df_eval.columns else y_te
             out_pred[target + '_pred'] = df_eval['y_pred'] if 'y_pred' in df_eval.columns else yhat_te
-            out_pred.to_csv(os.path.join(args.results_dir, f"RF_preds_time_{rep['train_years']}_{args.test_year}.csv"), index=False)
+            out_pred.to_csv(os.path.join(args.results_dir, f"XGB_preds_time_{rep['train_years']}_{args.test_year}.csv"), index=False)
     except Exception as e:
         print(f"[WARN] Không lưu được predictions: {e}")
 
@@ -497,29 +420,31 @@ def main():
     p.add_argument('--winsor_upper', type=float, default=1.0)
     p.add_argument('--scale_numeric', action='store_true')
     p.add_argument('--drop_first', action='store_true')
-    p.add_argument('--onehot_geo', choices=['none','province','district','commune'], default='district')
     p.add_argument('--year_as_category', action='store_true')
     p.add_argument('--exclude_related_income', action='store_true')
-    p.add_argument('--rare_min_count', type=int, default=0, help='>0 để gộp danh mục hiếm thành Other trước OHE')
 
     # Target transform
     p.add_argument('--log_target', choices=['none','log1p','asinh'], default='log1p')
     p.add_argument('--smearing', action='store_true', help='Chỉ dùng cho log1p khi back-transform')
 
-    # RF hyperparams
-    p.add_argument('--n_estimators', type=int, default=1000)
-    p.add_argument('--max_depth', type=int, default=0, help='0 hoặc âm = None')
-    p.add_argument('--min_samples_leaf', type=int, default=3)
-    p.add_argument('--max_features', default='sqrt')  # 'sqrt'|'log2'|float in (0,1]|int
+    # XGB hyperparams
+    p.add_argument('--n_estimators', type=int, default=1500)
+    p.add_argument('--learning_rate', type=float, default=0.03)
+    p.add_argument('--max_depth', type=int, default=6)
+    p.add_argument('--subsample', type=float, default=0.9)
+    p.add_argument('--colsample_bytree', type=float, default=0.9)
+    p.add_argument('--reg_lambda', type=float, default=2.0)
+    p.add_argument('--reg_alpha', type=float, default=0.0)
+    p.add_argument('--min_child_weight', type=float, default=1.0)
+    p.add_argument('--gamma', type=float, default=0.0)
     p.add_argument('--random_state', type=int, default=42)
-    p.add_argument('--oob', action='store_true', help='Bật OOB scoring cho RF (R2_OOB)')
 
-    # Permutation importance
-    p.add_argument('--perm_importance', action='store_true')
-    p.add_argument('--pi_repeats', type=int, default=5)
+    # Early stopping
+    p.add_argument('--early_stopping_rounds', type=int, default=0, help='>0 để bật; dùng val_size để tách validation')
+    p.add_argument('--val_size', type=float, default=0.0, help='Tỷ lệ validation từ train (0..0.5)')
 
     # I/O
-    p.add_argument('--results_dir', type=str, default='./results_rf')
+    p.add_argument('--results_dir', type=str, default='./results_xgb')
     p.add_argument('--save_predictions', action='store_true')
 
     args = p.parse_args()
@@ -551,13 +476,13 @@ def main():
 
     test_df = df2016 if args.test_year == 2016 else (df2014 if args.test_year == 2014 else df2010)
 
-    # Run
+    # Chạy
     res = run_time_split(train_dfs, test_df, args.target, args, schema)
 
-    # Save results
-    out_csv = os.path.join(args.results_dir, f"RF_{args.target}_time_{train_label}_{args.test_year}.csv")
+    # Lưu kết quả
+    out_csv = os.path.join(args.results_dir, f"XGB_{args.target}_time_{train_label}_{args.test_year}.csv")
     res.to_csv(out_csv, index=False)
-    print("=== Time-split RF Results ===")
+    print("=== Time-split XGB Results ===")
     print(res.to_string(index=False))
     print(f"[DONE] Saved: {out_csv}")
 
